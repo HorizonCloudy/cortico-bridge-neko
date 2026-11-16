@@ -1,0 +1,31 @@
+# cortico-bridge-neko 插件清单（字段按 r-neko 实测值钉，upstream/neko @52e973ed2）
+# 必填三件 = plugin.id / plugin.name / plugin.entry（schema.py:294 实测，缺一 ValidationError）。
+# `host` 键出现即拒；id 限 ^[a-zA-Z0-9_-]{1,128}$；entry 限 ^[a-zA-Z0-9_.]+:[a-zA-Z0-9_]+$。
+# 目录名 cortico-bridge-neko（kebab）≡ 包名 cortico_bridge_neko（snake），宿主按
+# entry_points.py:47-55 的目录名匹配规则加载；安装 = 放进宿主用户插件目录，整目录名保持 kebab 即可。
+
+[plugin]
+id = "cortico_bridge"
+name = "Cortico Bridge"
+entry = "cortico_bridge_neko:CorticoBridgePlugin"
+version = "0.1.0"
+description = "Cortico 与 N.E.K.O 的 CBP 帧桥。入站只订阅 bus.messages；出站只有 push_message v2 与 reply_tail 两扇门。"
+author = { name = "Cortico" }
+type = "plugin"
+
+[plugin.sdk]
+# 版本闸只认 SDK_VERSION = "0.1.0" 空间（constants.py:9），不写 APP_VERSION 0.9.1；
+# 写 0.9.x 的 supported 会永远加载失败且 CI 看不见（_BUILD-PLAN T1）。
+# 必须是 SpecifierSet 语法：裸版本串与 wildcard 一律判 invalid specifier 直接拒载
+# （registry.py:1139-1141/1167 @52e973ed2，r-neko §2 实测表）。
+supported = ">=0.1.0,<0.2.0"
+recommended = ">=0.1.0,<0.2.0"
+
+[plugin_runtime]
+enabled = true
+# 骨架期不自动起 WS 外拨；装机自检（tests/）过了再按部署手册改 auto_start。
+# 先例口径：内置 mcp_adapter 实测申报 sdk=('>=0.1.0,<0.3.0','>=0.1.0,<0.2.0',...)（r-neko §3），
+# 区间写宽不写死，升级复核只动 [plugin.sdk] 这一段。
+auto_start = false
+timeout = 30.0          # 0 < t <= 300（r-neko §3 实测）
+startup_failure = "warn"

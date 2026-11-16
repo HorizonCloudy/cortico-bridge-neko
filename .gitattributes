@@ -1,0 +1,7 @@
+# 与上游 plugin-forge 同口径（plugin-forge-publish@ac9af4d6 .gitattributes 逐字照抄其 Python 规则与理由）：
+# python 一律 LF：仓库里有一个文件曾被写成 CR CR LF，扫描器自报行号因此翻倍。
+*.py text eol=lf
+
+# 本仓其余文本同样锁 LF：Windows 检出端 autocrlf 会注入 CRLF。口径对齐上游 neko
+# （upstream/neko/.gitattributes:2 `* text=auto eol=lf`），防同一 CR 事故复发。
+* text=auto eol=lf
