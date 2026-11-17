@@ -32,7 +32,7 @@ def _plugin(bridge, *, egress=True, ttl=300.0, clock=None):
     plugin._pins = support.PINS_SAMPLE
     plugin._egress_open = egress
     plugin._link_open = True
-    plugin._link_task = object()  # 只需非 None：_emit_frame 走入队分支
+    plugin._link_ready = True  # _emit_frame 只认握手完成（ready 帧已到）
     plugin._outgoing = asyncio.Queue()
     kwargs = {"ttl": ttl}
     if clock is not None:

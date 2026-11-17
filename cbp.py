@@ -22,7 +22,6 @@ from .cbp_table import (  # MSG_KINDS/TOOL_RISKS/ANON_VALUES 经本模块对外�
     _ACTOR_KEYS,
     _ID_MAX,
     _MEMBER_KEYS,
-    _OPTIONAL,
     _REQUIRED,
     _SELF_KEYS,
     _STR_MAX,

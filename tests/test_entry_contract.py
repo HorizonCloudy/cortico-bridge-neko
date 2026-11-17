@@ -83,7 +83,7 @@ def test_entry_class_decorated_and_lifecycle_async(bridge):
 
     cls = bridge.CorticoBridgePlugin
     assert getattr(cls, NEKO_PLUGIN_TAG, None) is True  # @neko_plugin 唯一动作 = 类标记
-    for name in ("start", "stop", "handle_frame"):
+    for name in ("_on_command_loop_start", "stop", "handle_frame"):
         assert inspect.iscoroutinefunction(getattr(cls, name)), f"{name} 必须 async（入口约定）"
 
 

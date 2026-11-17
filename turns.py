@@ -5,9 +5,12 @@
   为准，并回一条 `event{name:"degraded"}`，`data.reason = "actor-mismatch"`。」
 - 「`turn` 查不到、或超出入站记录保留窗 → 拒执行，回 `reply{ok:false,error:{code:60004,
   message:"unknown_session: ..."}}`」。
-窗长口径：取 §5.1 的 rid 缓存口径（SECURITY-CBP.md:38 指 §5.1，:222 定 TTL 300 秒、上限 200，
-先例 `bridge.py:65-66`）。CHANGELOG-CBP.md:488-490 开放项 2 记的「300 秒 vs 限流窗」之争
-按该句原文取 rid 缓存口径，不取 60 帧/分窗。
+窗长口径（工单二 N8/F2，用户 2026-11-17 拍板：同源可调、缺省 300）：
+单一源 = fleet `spec/CBP-v1.json` 经 `tools/gen_table.py` 落到 `cbp_table.py` 的
+`TURN_TTL_SECONDS`（秒，正数）。读序：环境变量 `CORTICO_TURN_TTL_SECONDS` 覆盖 >
+生成表 > 回落 300（回落时记一条 degraded，不静默）。上限 200 条沿用
+§5.1 rid 缓存口径（SECURITY-CBP.md:222，先例 bridge.py:66）。
+CHANGELOG-CBP.md:488-490 开放项 2 的「300 秒 vs 600 秒」之争由该拍板收口。
 
 anon 判定（SECURITY-CBP.md:35）：`member.id == self.id` → self；载荷带匿名位 → anonymous；
 宿主没给发信人 → unknown；其余 → identified。N.E.K.O 线 self 永久 `proven:false`
@@ -16,20 +19,54 @@ anon 判定（SECURITY-CBP.md:35）：`member.id == self.id` → self；载荷�
 """
 from __future__ import annotations
 
+import os
 import time
 from collections import OrderedDict
 from typing import Any, Callable, Iterator
 
-TTL_SECONDS = 300.0  # §5.1 rid 缓存口径（SECURITY-CBP.md:222）
-MAX_ENTRIES = 200    # 同上，先例 bridge.py:66
+from . import cbp_table  # 同源读取（N8）：表行由 fleet 生成器落，缺位时 getattr 返回 None 走降级
+
+ENV_TURN_TTL = "CORTICO_TURN_TTL_SECONDS"  # 两端同名（工单二 F2）
+_TTL_FALLBACK_SECONDS = 300.0  # shortcut: 仅表行缺位时的降级回落，同时记 degraded；fleet 落表后不再走到
+MAX_ENTRIES = 200    # §5.1 rid 缓存口径（SECURITY-CBP.md:222），先例 bridge.py:66
+
+
+def _positive_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value > 0 else None
+
+
+def turn_ttl_seconds() -> tuple[float, str | None]:
+    """返回 (窗长秒数, 降级原因或 None)。读序：环境变量 > 生成表 > 回落 300。"""
+    env_raw = os.environ.get(ENV_TURN_TTL, "").strip()
+    table_value = _positive_number(getattr(cbp_table, "TURN_TTL_SECONDS", None))
+    if env_raw:
+        env_value = _positive_number(_coerce(env_raw))
+        if env_value is not None:
+            return env_value, None
+        return (table_value if table_value is not None else _TTL_FALLBACK_SECONDS), "turn-ttl-env-invalid"
+    if table_value is not None:
+        return table_value, None
+    return _TTL_FALLBACK_SECONDS, "turn-ttl-table-missing"
+
+
+def _coerce(raw: str) -> Any:
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 class TurnLedger:
     """有界保时窗的 turn → actor 表。只登记桥自己发出去的 msg 帧。"""
 
-    def __init__(self, *, ttl: float = TTL_SECONDS, cap: int = MAX_ENTRIES,
+    def __init__(self, *, ttl: float | None = None, cap: int = MAX_ENTRIES,
                  now: Callable[[], float] = time.monotonic) -> None:
-        self._ttl = float(ttl)
+        resolved, degraded = turn_ttl_seconds()
+        self.ttl_seconds = float(ttl) if ttl is not None else resolved
+        self.ttl_degraded = None if ttl is not None else degraded
+        self._ttl = self.ttl_seconds
         self._cap = int(cap)
         self._now = now
         self._rows: "OrderedDict[str, tuple[float, dict[str, Any]]]" = OrderedDict()

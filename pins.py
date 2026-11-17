@@ -35,12 +35,27 @@ def load_pins(path: str | None = None) -> dict[str, Any]:
     return data
 
 
+# 真台账 ports 是记录数组（fleet spec/pins.json:280 起，每行 owner/port/bind 等），
+# 测试夹具走 dict 形。两形都读，本表把键折成台账 owner 全串，零端口字面量。
+_OWNER_BY_KEY = {
+    "cortico_world_neko_ws": "cortico-world-neko listen",
+    "cortico_world_maibot_ws": "cortico-world-maibot listen",
+}
+
+
 def port_of(pins: dict[str, Any], key: str) -> int:
     """从 pins['ports'] 取整数端口；缺键即报错，不做默认值。"""
     ports = pins.get("ports")
-    if not isinstance(ports, dict) or key not in ports:
+    if isinstance(ports, list):
+        owner = _OWNER_BY_KEY.get(key, key)
+        rows = [e for e in ports if isinstance(e, dict) and e.get("owner") == owner]
+        if len(rows) != 1:
+            raise RuntimeError(f"pins.json ports 台账里 owner={owner!r} 命中 {len(rows)} 行（需恰好 1 行）")
+        value = rows[0].get("port")
+    elif isinstance(ports, dict) and key in ports:
+        value = ports[key]
+    else:
         raise RuntimeError(f"pins.json 缺 ports.{key}")
-    value = ports[key]
     if isinstance(value, bool) or not isinstance(value, int) or not (1 <= value <= 65535):
         raise RuntimeError(f"pins.json ports.{key} 非有效端口: {value!r}")
     return int(value)

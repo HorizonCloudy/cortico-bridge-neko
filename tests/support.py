@@ -141,7 +141,7 @@ class FakeCtx:
         self.push_calls: list[tuple[tuple, dict]] = []
         self.logger = logging.getLogger("fake-neko-ctx")
 
-    async def push_message(self, *args: Any, **kwargs: Any) -> Any:
+    def push_message(self, *args: Any, **kwargs: Any) -> Any:  # 同步：与真宿主同形
         self.push_calls.append((args, kwargs))
         return self._push_results.pop(0) if len(self._push_results) > 1 else self._push_results[0]
 

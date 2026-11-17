@@ -1,19 +1,18 @@
 """cortico-bridge-neko —— Cortico ↔ N.E.K.O 的 CBP 桥（宿主原生插件，Python 3.11 桶）。
 
-骨架范围（_BUILD-PLAN §2.4/§3.4-1；蓝图 L83）：入口契约、bus watch 映射、
-push_message v2 / reply_tail 两条出站门、CBP WS 外拨链路。
-不启动宿主、不监听任何端口、不连 IM；连接只在配置显式放行后发生。
+范围（_BUILD-PLAN §2.4/§3.4-1；蓝图 L83；工单 K2）：入口契约、bus watch 映射、
+两条投递门（push_message v2 / reply_tail）、一条对端调用门（tools.py）、CBP WS 外拨链路。
+不启动宿主、不监听任何端口、不连 IM。投递门读清单 `[cortico]` 表，缺省关；
+开关生效要重启插件。连接只在配置显式放行后发生。
 """
 from __future__ import annotations
 
 import asyncio
-import json
-import time
 from typing import Any
 
-from plugin.sdk.plugin import Err, NekoPluginBase, Ok, neko_plugin  # __all__ 58 名内（r-neko §4）
+from plugin.sdk.plugin import NekoPluginBase, Ok, lifecycle, neko_plugin  # __all__ 58 名内（r-neko §4）
 
-from . import cbp, ingress, pins as pins_mod, replytail, turns
+from . import cbp, ingress, pins as pins_mod, replytail, tools, turns
 from .convmap import ConvMap
 from .watch import BusWatch
 
@@ -27,7 +26,7 @@ _BRIDGE_TOOLS: list[dict[str, Any]] = [
     {"name": "neko_reply_tail_register", "risk": "write", "confirm_required": False},
 ]
 _TOOL_RISK = {t["name"]: t["risk"] for t in _BRIDGE_TOOLS}
-_BRIDGE_CAPS = ["inbound_msg", "push_message_v2", "reply_tail"]
+_BRIDGE_CAPS = ["inbound_msg", "push_message_v2", "reply_tail", "tools"]  # tools=K2（CBP 九名词表内）
 
 
 def _warn(self: Any, message: str) -> None:
@@ -53,43 +52,47 @@ class CorticoBridgePlugin(NekoPluginBase):
     两扇门都在 F3 身份门**之后**：`turn` 查不到入站记录先 60004，写动作再要求 `anon=="identified"`。
     """
 
-    # ---------- 配置面（全保守缺省：门全关） ----------
-    def _cfg(self, key: str, default: Any = False) -> Any:
-        cfg = getattr(self.ctx, "config", None)
-        if isinstance(cfg, dict):
-            return cfg.get(key, default)
-        getter = getattr(cfg, "get", None)
-        if callable(getter):
-            try:
-                return getter(key, default)
-            except Exception:
-                return default
-        return default
+    # ---------- 生命周期 ----------
+    # 类体缺省：宿主未走完 startup 也要能安全调用 stop，且 hook 重入靠 _link_task 挡。
+    _link_task: Any = None
+    _link_ready: bool = False
+    _frames_bad: int = 0  # N1：被吞掉的坏帧/炸帧计数（读帧循环逐帧隔离）
+    _ttl_degraded_reported: bool = False  # N8：turn 窗回落 degraded 只在首个 ready 后报一次
 
-    # ---------- 生命周期（入口一律 async，返 Ok/Err 不靠 raise） ----------
-    async def start(self) -> Any:
+    # 长寿命 command loop 内调用本钩子（host.py:1580-1588 @52e973e）：create_task 才活得下来。
+    # 裸 startup 跑在瞬态 asyncio.run 里，返回即掐死任务（host.py:1332、
+    # game_agent_minecraft/__init__.py:193-202）。返 Ok/Err 没有契约：异常只记日志。
+    async def _on_command_loop_start(self) -> None:
+        if self._link_task is not None:
+            return  # 重入挡：loop 重启不得叠挂第二条外拨链
         try:
             self._pins = pins_mod.load_pins()
-        except RuntimeError as exc:
-            return Err(str(exc))
-        self._egress_open = bool(self._cfg("egress", False))
-        self._link_open = bool(self._cfg("link_enabled", False))
+        except (OSError, ValueError, RuntimeError) as exc:  # N6：pins 异常族（缺文件、坏 JSON、缺键）收一行，不许漏出钩子
+            _warn(self, f"pins.json load failed: {exc}")
+            return  # 门关、不触网：端口无从解析，行为与旧 Err 分支等价
+        eff = await self.config.dump()
+        sec = eff.get("cortico") if isinstance(eff.get("cortico"), dict) else {}
+        self._egress_open = bool(sec.get("egress", False))
+        self._link_open = bool(sec.get("link_enabled", False))
         self._convmap = ConvMap(getattr(self.ctx, "store", None))
-        self._turns = turns.TurnLedger()  # F3：call 的身份来源只有这张表
+        self._turns = turns.TurnLedger()  # F3：call 的身份来源只有这张表；窗长同源读取（N8）
+        if self._turns.ttl_degraded is not None:
+            _warn(self, f"turn TTL degraded: {self._turns.ttl_degraded}; using {self._turns.ttl_seconds}s")
+        self._peer_tools = tools.PeerTools(self)  # 对端 catalog → @llm_tool（K2）
         self._outgoing: asyncio.Queue[str] = asyncio.Queue()
-        self._link_task: asyncio.Task | None = None
         self._watch = BusWatch(emit=self._emit_frame)
         if not self._watch.attach(self.ctx):
             _warn(self, "bus.messages watch 不可用：入站关闭，出站不受影响")
         if self._link_open:
             self._link_task = asyncio.create_task(self._link_loop())
-        return Ok(None)
 
+    @lifecycle(id="shutdown")
     async def stop(self) -> Any:
-        if self._link_task is not None:
-            self._link_task.cancel()
+        task = getattr(self, "_link_task", None)
+        if task is not None:
+            task.cancel()
             try:
-                await self._link_task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
             self._link_task = None
@@ -97,6 +100,9 @@ class CorticoBridgePlugin(NekoPluginBase):
         stop = getattr(watcher, "stop", None) if watcher is not None else None
         if callable(stop):
             stop()
+        peer = getattr(self, "_peer_tools", None)
+        if peer is not None:
+            peer.shutdown()
         return Ok(None)
 
     @property
@@ -110,15 +116,19 @@ class CorticoBridgePlugin(NekoPluginBase):
 
     # ---------- 帧路由 ----------
     def _emit_frame(self, frame: dict[str, Any]) -> None:
-        """入站 CBP 帧排队外拨。桥侧未连接时丢弃并计数（骨架期 Cortico 侧不在场属常态）。
+        """入站 CBP 帧排队外拨。桥侧未握手时丢弃并计数（骨架期 Cortico 侧不在场属常态）。
 
+        判据是 `_link_ready`（ready 帧已到），不是「有没有 task」：有 task 只说明在拨号。
         F3：只有真排出去的 msg 帧才进 turn 账本——Cortico 只可能拿它见过的帧 id 当 turn。
         """
-        if not (self._link_open and self._link_task is not None):
+        if not (self._link_open and self._link_ready):
             self._dropped = getattr(self, "_dropped", 0) + 1
             return
         if frame.get("t") == "msg":
             self._turn_ledger.record(frame)
+            peer = getattr(self, "_peer_tools", None)
+            if peer is not None:
+                peer.note_msg(frame)  # 出站 call 的 turn 源（K2）
         self._outgoing.put_nowait(cbp.encode(frame))
 
     async def handle_frame(self, frame: dict[str, Any]) -> dict[str, Any]:
@@ -155,6 +165,7 @@ class CorticoBridgePlugin(NekoPluginBase):
                     pins=self._pins,
                     egress_open=self._egress_open,
                     segments=list(args.get("segments") or []),
+                    text=str(args.get("text") or ""),
                     visibility=args.get("visibility"),
                     ai_behavior=args.get("ai_behavior") or "respond",
                     metadata={"cbp_rid": rid},
@@ -204,25 +215,84 @@ class CorticoBridgePlugin(NekoPluginBase):
     async def _link_once(self) -> None:
         import websockets  # 延迟导入：自省/单测不触网
 
-        hello = cbp.hello_frame(
-            agent_name=BRIDGE_NAME, version=BRIDGE_VERSION, sha=BRIDGE_SHA,
-            caps=list(_BRIDGE_CAPS), tools=list(_BRIDGE_TOOLS),
-            # F1/§2：握手首帧必带 self。N.E.K.O 线永久 proven:false——bus 面只有读与 watch、
-            # 无 publish，没有实证 bot 主键的口子（SECURITY-CBP.md:72,270）。空 id 是诚实申报，
-            # 不许拿 role=="assistant" 启发式冒充实证，也不许因为报不了就不带 self。
-            self_decl=cbp.make_self_decl(),
-        )
-        # F4/§3：共享密钥只走 HTTP Upgrade 头，禁过 URL query（SECURITY-CBP.md:115）。
-        # 缺 token → 空头，本桥不自行降级成 query 形式。
-        async with websockets.connect(self._ws_uri(), open_timeout=12,
-                                      additional_headers=pins_mod.auth_headers()) as ws:
-            await ws.send(cbp.encode(hello))
-            async for raw in ws:
-                frame = cbp.decode(raw if isinstance(raw, (str, bytes)) else bytes(raw))
-                if frame is None:
-                    continue  # 坏帧吞掉（内核硬规则）
-                if frame["t"] == "call":
-                    result = await self.handle_frame(frame)
-                    await ws.send(cbp.encode(self.reply_frame(frame, result)))
-                while not self._outgoing.empty():
-                    await ws.send(self._outgoing.get_nowait())
+        try:
+            hello = cbp.hello_frame(
+                agent_name=BRIDGE_NAME, version=BRIDGE_VERSION, sha=BRIDGE_SHA,
+                caps=list(_BRIDGE_CAPS), tools=list(_BRIDGE_TOOLS),
+                # F1/§2：握手首帧必带 self。N.E.K.O 线永久 proven:false——bus 面只有读与 watch、
+                # 无 publish，没有实证 bot 主键的口子（SECURITY-CBP.md:72,270）。空 id 是诚实申报，
+                # 不许拿 role=="assistant" 启发式冒充实证，也不许因为报不了就不带 self。
+                self_decl=cbp.make_self_decl(),
+            )
+            # F4/§3：共享密钥只走 HTTP Upgrade 头，禁过 URL query（SECURITY-CBP.md:115）。
+            # 缺 token → 空头，本桥不自行降级成 query 形式。
+            self._link_ready = False
+            async with websockets.connect(self._ws_uri(), open_timeout=12,
+                                          additional_headers=pins_mod.auth_headers()) as ws:
+                await ws.send(cbp.encode(hello))
+                # 出站独立写手：自发帧（bus msg / degraded / call 回帧）不能等对端下一帧才搭车发。
+                # 内核 PING 间隔 20s，搭车最坏迟 20s，还会吃掉对端 30s 关联窗，造出假 60007。
+                pump = asyncio.create_task(self._pump_out(ws))
+                try:
+                    async for raw in ws:
+                        # N1：逐帧异常隔离。一帧炸不掉整条链，call 帧的 reply 必回。
+                        try:
+                            frame = cbp.decode(raw if isinstance(raw, (str, bytes)) else bytes(raw))
+                        except Exception as exc:
+                            self._frames_bad += 1
+                            _warn(self, f"CBP 入帧解码炸掉并吞掉: {exc!r}")
+                            continue
+                        if frame is None:
+                            self._frames_bad += 1
+                            continue  # 坏帧吞掉并计数（内核硬规则）
+                        if frame["t"] == "ready":
+                            # 内核 listener 收到 hello 即回 ready（driver.ts:563-571 @c85a87b）。
+                            # 这行 info 是握手判据 D1 的桥侧证据。
+                            self._link_ready = True
+                            logger = getattr(self, "logger", None)
+                            if logger is not None:
+                                logger.info(f"CBP link ready: peer caps {frame.get('caps')}")
+                            if self._turns.ttl_degraded and not self._ttl_degraded_reported:
+                                self._ttl_degraded_reported = True
+                                self._emit_frame(cbp.make_frame(
+                                    "event", name="degraded",
+                                    data={"reason": self._turns.ttl_degraded,
+                                          "ttl_seconds": self._turns.ttl_seconds}))
+                        if frame["t"] == "call":
+                            try:
+                                result = await self.handle_frame(frame)
+                            except Exception as exc:
+                                # handle_frame 只兜 DoorError；其余异常在这一层收口（N1）。
+                                self._frames_bad += 1
+                                result = {"ok": False, "code": 20002,
+                                          "detail": f"internal_handler_error: {exc!r}"}
+                            await ws.send(cbp.encode(self.reply_frame(frame, result)))
+                        else:
+                            # K2：hello/ready/catalog → G5 对账；reply → 结算出站 call（其余类型自筛）
+                            try:
+                                peer = getattr(self, "_peer_tools", None)
+                                if peer is not None:
+                                    peer.on_frame(frame)
+                            except Exception as exc:
+                                self._frames_bad += 1
+                                _warn(self, f"CBP 入帧 {frame['t']} 处理炸掉并吞掉: {exc!r}")
+                finally:
+                    self._link_ready = False
+                    pump.cancel()
+                    try:
+                        await pump
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        finally:
+            # G-K2-3：链路任何退出（正常/异常/取消）都把 pending 调用落账，重连不拖死 30s 空转
+            peer = getattr(self, "_peer_tools", None)
+            if peer is not None:
+                peer.drop_pending()
+
+    async def _pump_out(self, ws: Any) -> None:
+        """出站独立写手：_outgoing 有帧即发，不等入帧。
+        与回帧同用 ws.send——websockets 的 send_context 串行化并发写，帧不撕裂。
+        退出靠 _link_once 的 finally cancel；ws 关闭 send 抛错交上层重连。
+        """
+        while True:
+            await ws.send(await self._outgoing.get())

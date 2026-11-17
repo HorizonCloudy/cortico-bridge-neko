@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -37,14 +38,20 @@ REASON_TO_CODE = {
     "transport_unavailable": 60006,
     "payload_too_large": 60003,
 }
+# N2：码位与语义逐一对着台账钉（spec/conformance.json error_codes、core errors.ts RET）：
+# 60003 只留给 payload_too_large（超限）；轴非法与无正文是参数问题，走 10003 Bad Param。
 ERR_DOOR_CLOSED = 60005
 ERR_VERSION = 60001
+ERR_PAYLOAD_TOO_LARGE = 60003
 ERR_UNKNOWN_SESSION = 60004
+ERR_BAD_PARAM = 10003
+ERR_INTERNAL = 20002
 ERR_DEGRADED = 60008
 
 
 class DoorError(Exception):
-    """本地拒收：门未开、轴非法、载荷超限。code 走 c1 §5.4 的 6xxxx 表。"""
+    """本地拒收：门未开（60005）、轴非法或无正文（10003 bad_param）、载荷超限（60003）。
+    code 对着台账枚举选位（spec/conformance.json error_codes；core errors.ts RET）。"""
 
     def __init__(self, code: int, message: str) -> None:
         super().__init__(f"{code} {message}")
@@ -67,28 +74,35 @@ def build_parts(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def validate_axes(visibility: list[str], ai_behavior: str) -> None:
     if not visibility or not all(v in VISIBILITY_VALUES for v in visibility):
-        raise DoorError(60003, f"visibility 必须落在 {VISIBILITY_VALUES}，收到 {visibility!r}")
+        raise DoorError(ERR_BAD_PARAM, f"bad_param: visibility 必须落在 {VISIBILITY_VALUES}，收到 {visibility!r}")
     if ai_behavior not in AI_BEHAVIOR_VALUES:
-        raise DoorError(60003, f"ai_behavior 必须落在 {AI_BEHAVIOR_VALUES}，收到 {ai_behavior!r}")
+        raise DoorError(ERR_BAD_PARAM, f"bad_param: ai_behavior 必须落在 {AI_BEHAVIOR_VALUES}，收到 {ai_behavior!r}")
 
 
 def push_kwargs(*, pins: dict[str, Any], egress_open: bool, segments: list[dict[str, Any]],
-                visibility: list[str] | None = None, ai_behavior: str = "respond",
+                text: str = "", visibility: list[str] | None = None,
+                ai_behavior: str = "respond",
                 metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """CBP 出站料 → push_message kwargs。上限只认 pins 台账（缺 caps 即抛，不回落）。
+    规范形 cv-call 的正文在顶层 `text`：`segments` 空且 `text` 非空时合成一个 text 段。
     不合规在这里拦，SDK 调用面永远 kwargs-only。"""
     if not egress_open:
         raise DoorError(ERR_DOOR_CLOSED, "door_closed: 出站门未开（egress=false）")
     cap = pins_mod.neko_payload_cap_bytes(pins)
     vis = list(visibility) if visibility else ["chat"]
     validate_axes(vis, ai_behavior)
+    if not segments and text:  # 规范形：正文只在顶层 text，段表为空
+        segments = [{"type": "text", "data": {"text": text}}]
     parts = build_parts(segments)
     if not parts:
-        raise DoorError(60003, "segments 全被丢弃：push 至少需要一个可渲染段")
+        # N2：这是参数问题（缺正文/段全畸形），不是超限；60003 只属于 payload_too_large。
+        if not segments:
+            raise DoorError(ERR_BAD_PARAM, "bad_param: segments 与 text 都空，push 至少需要一个可渲染段")
+        raise DoorError(ERR_BAD_PARAM, "bad_param: 段表非空但没有一个合法可渲染段")
     payload = json.dumps({"visibility": vis, "ai_behavior": ai_behavior, "parts": parts},
                          ensure_ascii=False)
     if len(payload.encode("utf-8")) > cap:
-        raise DoorError(60003,
+        raise DoorError(ERR_PAYLOAD_TOO_LARGE,
                         f"payload_too_large: 超台账 caps.neko.frame_bytes={cap} 本地先拒")
     return {"visibility": vis, "ai_behavior": ai_behavior, "parts": parts,
             "metadata": metadata or {}}
@@ -107,6 +121,11 @@ def outcome_from_result(result: Any) -> tuple[bool, int | None, str]:
 
 
 async def push(ctx: Any, kwargs: dict[str, Any]) -> tuple[bool, int | None, str]:
-    """执行 push_message。只按 kwargs 形传参（C1-6 硬规则：位参不可依赖）。"""
-    result = await ctx.push_message(**kwargs)
+    """执行 push_message。只按 kwargs 形传参（C1-6 硬规则：位参不可依赖）。
+
+    真宿主 push_message 同步（core/context.py:1050 @52e973e）。to_thread 是宿主
+    自家 async 壳的形状（core/context.py:1509-1516）：await 同步方法会 TypeError，
+    且不被 except DoorError 兜住，会拆掉整条连接。
+    """
+    result = await asyncio.to_thread(ctx.push_message, **kwargs)
     return outcome_from_result(result)

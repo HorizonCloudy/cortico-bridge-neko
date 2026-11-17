@@ -1,15 +1,16 @@
 # cortico-bridge-neko 插件清单（字段按 r-neko 实测值钉，upstream/neko @52e973ed2）
 # 必填三件 = plugin.id / plugin.name / plugin.entry（schema.py:294 实测，缺一 ValidationError）。
 # `host` 键出现即拒；id 限 ^[a-zA-Z0-9_-]{1,128}$；entry 限 ^[a-zA-Z0-9_.]+:[a-zA-Z0-9_]+$。
-# 目录名 cortico-bridge-neko（kebab）≡ 包名 cortico_bridge_neko（snake），宿主按
-# entry_points.py:47-55 的目录名匹配规则加载；安装 = 放进宿主用户插件目录，整目录名保持 kebab 即可。
+# 安装目录名必须等于 [plugin].id（cortico_bridge，或同形 kebab cortico-bridge）。
+# 宿主强制 entry=plugins.<id>:Class 且 包≡id≡目录（project_sources.py:87-113 @52e973e）。
+# 仓克隆名 cortico-bridge-neko 不是合法安装名，不能直接当目录装进宿主。
 
 [plugin]
 id = "cortico_bridge"
 name = "Cortico Bridge"
-entry = "cortico_bridge_neko:CorticoBridgePlugin"
+entry = "plugin.plugins.cortico_bridge:CorticoBridgePlugin"
 version = "0.1.0"
-description = "Cortico 与 N.E.K.O 的 CBP 帧桥。入站只订阅 bus.messages；出站只有 push_message v2 与 reply_tail 两扇门。"
+description = "Cortico 与 N.E.K.O 的 CBP 帧桥。入站只订阅 bus.messages；投递只走 push_message v2 与 reply_tail 两扇门；另有对端申报工具注册的出站 call 面（tools.py，K2）。"
 author = { name = "Cortico" }
 type = "plugin"
 
@@ -29,3 +30,9 @@ enabled = true
 auto_start = false
 timeout = 30.0          # 0 < t <= 300（r-neko §3 实测）
 startup_failure = "warn"
+
+[cortico]
+# 出站两开关。值真了才开门；改值须重启插件（桥未实现 refresh_runtime_config，
+# 普通配置写入也不推送运行中子进程，见 README 部署节）。
+egress = false
+link_enabled = false
