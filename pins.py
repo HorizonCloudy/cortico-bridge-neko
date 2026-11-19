@@ -88,12 +88,18 @@ def auth_headers(config: dict[str, Any] | None = None) -> dict[str, str]:
 
     只从 `CORTICO_BRIDGE_TOKEN` 环境变量取数（SECURITY-CBP.md:121）。形参 `config`
     存在只为把「配置文件里的 token 一律无视」这件事写成可测的码：调用方可以把整个配置
-    传进来，本函数不读它的任何键。缺 token 就返回空头——环回免鉴权是 Cortico 侧 listen
-    的裁量（§3 第 2 条环回纪律），桥不自己发明缺省密钥。
+    传进来，本函数不读它的任何键。
+    2026-11-19（11-13 判例）：缺 token 不再返回空头「环回免鉴权」，直接拒绝建链——
+    浏览器 WebSocket 没有 CORS 预检，本机任意网页都能连环回端口。
     """
     del config  # 故意不读：凭据不落配置文件
     token = os.environ.get(TOKEN_ENV, "").strip()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    if not token:
+        raise RuntimeError(
+            f"缺少共享密钥：设环境变量 {TOKEN_ENV}（Cortico 侧用 ctx.secret 读同名键）；"
+            "本机任意网页都能连 WebSocket 端口，无密钥一律不建链"
+        )
+    return {"Authorization": f"Bearer {token}"}
 
 
 def bridge_ws_uri(pins: dict[str, Any], key: str = "cortico_world_neko_ws") -> str:

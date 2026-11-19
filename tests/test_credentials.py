@@ -73,17 +73,50 @@ def test_auth_header_is_bearer_form(bridge, monkeypatch):
     assert bridge.pins.auth_headers() == {"Authorization": f"Bearer {TOKEN}"}
 
 
-def test_no_token_means_no_header(bridge, monkeypatch):
+def test_missing_shared_secret_refuses_dial(bridge, monkeypatch):
+    """2026-11-19（11-13 判例）：空 token 不再是「环回免鉴权」，取数口直接 fail-shut。
+
+    WebSocket 不受同源策略/CORS 预检保护，本机任意网页都能拨环回端口，因此
+    「没配密钥」必须等价于「不建链」，而不是「不带头但照连」。
+    """
     monkeypatch.delenv(bridge.pins.TOKEN_ENV, raising=False)
-    assert bridge.pins.auth_headers() == {}
+    with pytest.raises(RuntimeError) as ei:
+        bridge.pins.auth_headers()
+    assert bridge.pins.TOKEN_ENV in str(ei.value)
+    assert "无密钥一律不建链" in str(ei.value)
 
 
 def test_config_token_is_ignored(bridge, monkeypatch):
-    """配置文件里的 token 一律无视：不落插件配置文件（SECURITY-CBP.md:121）。"""
+    """配置文件里的 token 一律无视：既不能替换环境值，也不能顶替缺失的环境密钥。"""
     monkeypatch.delenv(bridge.pins.TOKEN_ENV, raising=False)
-    assert bridge.pins.auth_headers({"token": TOKEN}) == {}
+    with pytest.raises(RuntimeError):
+        bridge.pins.auth_headers({"token": TOKEN})
     monkeypatch.setenv(bridge.pins.TOKEN_ENV, "from-env")
     assert bridge.pins.auth_headers({"token": TOKEN})["Authorization"] == "Bearer from-env"
+
+
+def test_link_loop_refuses_without_shared_secret(bridge, monkeypatch):
+    """_link_loop 入口 fail-shut：零拨号、不进重连循环、留一条不含密钥的日志。"""
+    captured: dict = {}
+    _install_fake_websockets(monkeypatch, captured)
+    monkeypatch.delenv(bridge.pins.TOKEN_ENV, raising=False)
+
+    logs: list[str] = []
+
+    class _H(logging.Handler):
+        def emit(self, record):
+            logs.append(record.getMessage())
+
+    ctx = support.FakeCtx()
+    ctx.logger = logging.getLogger("neko-no-secret-fence")
+    ctx.logger.handlers[:] = [_H()]
+    ctx.logger.setLevel(logging.WARNING)
+
+    asyncio.run(_plugin(bridge, ctx)._link_loop())
+
+    assert captured == {}, "缺密钥时一次 connect 都不许发生"
+    assert any("CBP link refused" in line for line in logs), logs
+    assert all(TOKEN not in line for line in logs), logs
 
 
 # ---------- URL 面：不得带凭据 ----------

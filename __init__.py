@@ -200,6 +200,13 @@ class CorticoBridgePlugin(NekoPluginBase):
 
     async def _link_loop(self) -> None:
         """断线重连照内核参数；start 永不 reject（本协程不抛，异常只回退避）。"""
+        # 2026-11-19：无共享密钥不建链（11-13 判例），明确记一条日志后退出，
+        # 不静默重试。Cortico 侧 listen 也同步改成缺密钥拒绑定，两端一致。
+        try:
+            pins_mod.auth_headers()
+        except RuntimeError as exc:
+            _warn(self, f"CBP link refused: {exc}")
+            return
         backoff = _BACKOFF_BASE_MS / 1000.0
         while True:
             try:
@@ -225,7 +232,7 @@ class CorticoBridgePlugin(NekoPluginBase):
                 self_decl=cbp.make_self_decl(),
             )
             # F4/§3：共享密钥只走 HTTP Upgrade 头，禁过 URL query（SECURITY-CBP.md:115）。
-            # 缺 token → 空头，本桥不自行降级成 query 形式。
+            # 缺密钥已在 _link_loop 入口 fail-shut 拒建链，此处 auth_headers() 必返回非空头。
             self._link_ready = False
             async with websockets.connect(self._ws_uri(), open_timeout=12,
                                           additional_headers=pins_mod.auth_headers()) as ws:

@@ -136,3 +136,25 @@ pytest 若把仓根当 Package 采集会按顶层模块 `"__init__"` 导入它�
 - 配置读取走清单 `[cortico]` 表：egress 与 link_enabled 缺省 False（门全关）。
 - `[plugin.entries]` wire 字段全集仍欠账（_BUILD-PLAN §6），清单未申报 entries。
 - PluginStore 方法名（get/set）是读侧证据口径，真机不符时只改 convmap 一处适配层。
+
+---
+
+## 安全声明（2026-11-19 · 对端能力面已收敛）
+
+本仓是框架侧插件，**不是 Cortico 扩展**，没有 `cortico.tags`，无法在索引仓自声明
+`unsafe`。对端 world 包 `cortico-world-neko` 上一轮曾拟按 11-13 判例声明，
+但该声明**从未发布即撤回**：`TAGS.md:40` 的不可撤回约束针对已发布版本；平台也没有
+`safe` 标签（`TAGS.md:42`），缺席只代表「未声明且未审查」。处理方式改为收敛能力面。
+
+本仓承担 dial 腿的鉴权收口：
+
+- `pins.auth_headers()` 缺 `CORTICO_BRIDGE_TOKEN` 抛 `RuntimeError`，不再返回空头；
+- `run()` / `_link_loop()` 入口 fail-shut：缺密钥零拨号、不进重连循环、只留一条日志；
+- 凭据只走 `Authorization: Bearer` Upgrade 头，URI 判脏即拒；
+- 能力面：`egress` 默认关、工具目录静态、未申报能力本地判 60002。
+
+**迁移（破坏性）**：插件进程环境变量必须设 `CORTICO_BRIDGE_TOKEN`，值与 Cortico 侧
+`ctx.secret('CORTICO_BRIDGE_TOKEN')` 逐字相同；未设时桥静默断连是设计行为。
+
+验证：`pytest tests/ -q` 全量通过；`tests/test_credentials.py` 覆盖取数口、
+URL 面、拨号面与静态闸。
